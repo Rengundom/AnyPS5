@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -26,9 +27,73 @@ std::atomic<std::uint64_t> caller{0};
     ready.store(false);
 }
 
+std::atomic<std::uint64_t> lastWord{0};
+
+bool Accepted(const void* address) {
+    std::uint64_t low = 0;
+    std::uint64_t high = 0;
+    const auto at = reinterpret_cast<std::uint64_t>(address);
+    if (!AgcDriver::ReadableStackRegion(at, low, high)) return false;
+    std::uint64_t last = 0;
+    std::memcpy(&last, reinterpret_cast<const void*>(high - sizeof(last)), sizeof(last));
+    lastWord.store(last);
+    return low <= at && at < high;
+}
+
+bool Rejected(const void* address) {
+    std::uint64_t low = 0;
+    std::uint64_t high = 0;
+    return !AgcDriver::ReadableStackRegion(reinterpret_cast<std::uint64_t>(address), low, high) && low == 0 && high == 0;
+}
+
+bool HasProtection(const void* address, DWORD expected) {
+    MEMORY_BASIC_INFORMATION memory{};
+    return VirtualQuery(address, &memory, sizeof(memory)) != 0 && memory.Protect == expected;
+}
+
+bool Fail(const char* what, DWORD protection) {
+    std::fprintf(stderr, "%s (protection 0x%lx)\n", what, static_cast<unsigned long>(protection));
+    return false;
+}
+
+bool CheckAllocated(DWORD allocation, DWORD protection, bool readable) {
+    void* page = VirtualAlloc(nullptr, 65536, allocation, protection);
+    if (page == nullptr) return Fail("cannot allocate the test region", protection);
+    const auto* inside = static_cast<const char*>(page) + 4096;
+    const bool committed = (allocation & MEM_COMMIT) != 0;
+    const bool passed = (!committed || HasProtection(page, protection)) && (readable ? Accepted(inside) : Rejected(inside));
+    VirtualFree(page, 0, MEM_RELEASE);
+    return passed || Fail(readable ? "a readable region was rejected" : "an unreadable region was accepted", protection);
+}
+
+bool CheckMapped(HANDLE section, DWORD access, DWORD protection) {
+    void* view = MapViewOfFile(section, access, 0, 0, 65536);
+    if (view == nullptr) return Fail("cannot map the copy-on-write view", protection);
+    const bool passed = HasProtection(view, protection) && Accepted(view);
+    UnmapViewOfFile(view);
+    return passed || Fail("a readable mapped view was rejected", protection);
+}
+
+bool CheckRegions() {
+    for (const DWORD protection : {PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE}) {
+        if (!CheckAllocated(MEM_RESERVE | MEM_COMMIT, protection, true)) return false;
+    }
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, 65536, nullptr);
+    if (section == nullptr) return Fail("cannot create the copy-on-write section", PAGE_EXECUTE_READWRITE);
+    const bool mapped = CheckMapped(section, FILE_MAP_COPY, PAGE_WRITECOPY) && CheckMapped(section, FILE_MAP_COPY | FILE_MAP_EXECUTE, PAGE_EXECUTE_WRITECOPY);
+    CloseHandle(section);
+    if (!mapped) return false;
+    for (const DWORD protection : {static_cast<DWORD>(PAGE_EXECUTE), static_cast<DWORD>(PAGE_NOACCESS), static_cast<DWORD>(PAGE_READWRITE | PAGE_GUARD)}) {
+        if (!CheckAllocated(MEM_RESERVE | MEM_COMMIT, protection, false)) return false;
+    }
+    if (!CheckAllocated(MEM_RESERVE, PAGE_READWRITE, false)) return false;
+    return Rejected(nullptr) || Fail("the null page was accepted", 0);
+}
+
 }
 
 int main() {
+    if (!CheckRegions()) return 1;
     const auto path = std::filesystem::temp_directory_path() / ("anyps5-process-stack-" + std::to_string(GetCurrentProcessId()) + ".txt");
     _putenv_s("APS5_SAMPLE_THREADS", path.string().c_str());
     _putenv_s("APS5_SAMPLE_WORKER", "");
