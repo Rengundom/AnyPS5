@@ -88,6 +88,15 @@ struct Sampler {
     }
 
     int walk(CONTEXT& context, std::array<std::uint64_t, WorkerDepth>& frames) {
+        if (context.Rsp < stackLow || context.Rsp >= stackHigh) {
+            MEMORY_BASIC_INFORMATION memory{};
+            stackLow = 0;
+            stackHigh = 0;
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(context.Rsp), &memory, sizeof(memory)) != 0 && memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0) {
+                stackLow = reinterpret_cast<std::uint64_t>(memory.BaseAddress);
+                stackHigh = stackLow + memory.RegionSize;
+            }
+        }
         const bool dwarf = stackHigh != 0 && context.Rsp >= stackLow && context.Rsp < stackHigh;
         int count = 0;
         while (count < depth && context.Rip != 0) {
